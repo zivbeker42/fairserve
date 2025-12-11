@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import deque, defaultdict
 from typing import Deque, Dict
 
-from models import Request, InteractionStage
+from models import Request
 
 
 class OIT:
@@ -37,8 +37,9 @@ class OIT:
         self._evict(dq_a, req.arrival_time)
         if not self.is_overloaded(kv_usage, running):
             return False
-        if req.stage != InteractionStage.USER_PROMPT:
-            return False
+        # Allow follow-on stages to proceed (stalled later)
+        if req.stage != req.application.expected_input_tokens.get(-1, -1):
+            pass
         # New interaction: apply RPM limits
         if len(dq_u) >= req.application.user_rpm_limit:
             return True

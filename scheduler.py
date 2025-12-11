@@ -20,8 +20,9 @@ class BaseScheduler:
         self,
         waiting: Deque[Request],
         interactions: Dict[int, Interaction],
-        snapshot,
-        max_to_release: int,
+        kv_tokens: int,
+        kv_capacity: int,
+        max_batch: int,
     ) -> List[Request]:
         raise NotImplementedError
 
@@ -29,17 +30,9 @@ class BaseScheduler:
 class FCFSScheduler(BaseScheduler):
     """Simple first-come-first-serve scheduler."""
 
-    def select_next_requests(
-        self,
-        waiting: Deque[Request],
-        interactions: Dict[int, Interaction],
-        snapshot,
-        max_to_release: int,
-    ) -> List[Request]:
-        kv_tokens = snapshot.kv_tokens_used
-        kv_capacity = snapshot.kv_tokens_capacity
+    def select_next_requests(self, waiting: Deque[Request], interactions: Dict[int, Interaction], kv_tokens: int, kv_capacity: int, max_batch: int) -> List[Request]:
         selected: List[Request] = []
-        while waiting and len(selected) < max_to_release and kv_tokens < kv_capacity:
+        while waiting and len(selected) < max_batch and kv_tokens < kv_capacity:
             nxt = waiting[0]
             if kv_tokens + nxt.input_tokens + nxt.system_tokens <= kv_capacity:
                 waiting.popleft()
@@ -73,17 +66,10 @@ class VTCScheduler(BaseScheduler):
         for req in served:
             self.counters[req.user.user_id] += self.w_q
 
-    def select_next_requests(
-        self,
-        waiting: Deque[Request],
-        interactions: Dict[int, Interaction],
-        snapshot,
-        max_to_release: int,
-    ) -> List[Request]:
-        kv_tokens = snapshot.kv_tokens_used
-        kv_capacity = snapshot.kv_tokens_capacity
+    def select_next_requests(self, waiting: Deque[Request], interactions: Dict[int, Interaction], kv_tokens: int, kv_capacity: int, max_batch: int) -> List[Request]:
         selected: List[Request] = []
-        while waiting and len(selected) < max_to_release:
+        while waiting and len(selected) < max_batch:
+            # pick user with smallest counter
             waiting_by_user: Dict[str, Request] = {}
             for req in waiting:
                 if req.user.user_id not in waiting_by_user:
@@ -92,6 +78,7 @@ class VTCScheduler(BaseScheduler):
                 break
             user_choice = min(waiting_by_user.keys(), key=lambda u: self.counters[u])
             candidate = waiting_by_user[user_choice]
+            # ensure capacity
             if kv_tokens + candidate.input_tokens + candidate.system_tokens > kv_capacity:
                 break
             waiting.remove(candidate)
@@ -129,30 +116,37 @@ class FairServeScheduler(BaseScheduler):
             inc = req.user.priority * self.gamma / self._weight(req)
             self.service[req.user.user_id] += inc
 
-    def select_next_requests(
-        self,
-        waiting: Deque[Request],
-        interactions: Dict[int, Interaction],
-        snapshot,
-        max_to_release: int,
-    ) -> List[Request]:
-        kv_tokens = snapshot.kv_tokens_used
-        kv_capacity = snapshot.kv_tokens_capacity
+    def select_next_requests(self, waiting: Deque[Request], interactions: Dict[int, Interaction], kv_tokens: int, kv_capacity: int, max_batch: int) -> List[Request]:
         selected: List[Request] = []
-        while len(selected) < max_to_release and kv_tokens < kv_capacity:
-            if not waiting:
+        # Prioritize incomplete interactions
+        ready_interactions = [inter for inter in interactions.values() if not inter.complete and inter.next_index < len(inter.requests)]
+        ready_users = {inter.requests[inter.next_index].user.user_id: inter for inter in ready_interactions if inter.next_index < len(inter.requests)}
+        while len(selected) < max_batch and kv_tokens < kv_capacity:
+            candidate: Optional[Request] = None
+            # Interaction continuation first
+            if ready_users:
+                uid = min(ready_users.keys(), key=lambda u: self.service[u])
+                inter = ready_users.pop(uid)
+                req = inter.requests[inter.next_index]
+                if kv_tokens + req.input_tokens + req.system_tokens <= kv_capacity:
+                    candidate = req
+                    inter.next_index += 1
+                else:
+                    break
+            else:
+                if not waiting:
+                    break
+                waiting_by_user: Dict[str, Request] = {}
+                for req in waiting:
+                    if req.user.user_id not in waiting_by_user:
+                        waiting_by_user[req.user.user_id] = req
+                uid = min(waiting_by_user.keys(), key=lambda u: self.service[u])
+                candidate = waiting_by_user[uid]
+                if kv_tokens + candidate.input_tokens + candidate.system_tokens > kv_capacity:
+                    break
+                waiting.remove(candidate)
+            if candidate is None:
                 break
-            continuation = [r for r in waiting if r.stage != InteractionStage.USER_PROMPT]
-            pool = continuation if continuation else list(waiting)
-            waiting_by_user: Dict[str, Request] = {}
-            for req in pool:
-                if req.user.user_id not in waiting_by_user:
-                    waiting_by_user[req.user.user_id] = req
-            uid = min(waiting_by_user.keys(), key=lambda u: self.service[u])
-            candidate = waiting_by_user[uid]
-            if kv_tokens + candidate.input_tokens + candidate.system_tokens > kv_capacity:
-                break
-            waiting.remove(candidate)
             selected.append(candidate)
             kv_tokens += candidate.input_tokens + candidate.system_tokens
         return selected
